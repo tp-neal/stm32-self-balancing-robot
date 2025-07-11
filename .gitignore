@@ -1,0 +1,23 @@
+# Build artifacts
+build/
+Build/
+Debug/
+Release/
+
+# IDE-specific files (example for VS Code)
+.vscode/
+
+# STM32CubeIDE generated files
+*.launch
+*.project
+*.cproject
+
+# Libraries/Drivers you don't want to track
+Drivers/STM32F4xx_HAL_Driver/
+Middlewares/
+
+# Miscellaneous
+*.o
+*.elf
+*.bin
+*.map
