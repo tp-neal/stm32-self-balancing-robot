@@ -42,63 +42,86 @@
 #include <string.h>
 #include <math.h>
 #include <inttypes.h>
+#include "queue.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 typedef struct {
-	float accel_pitch;
-	float gyro_pitch;
-	float comp_pitch;
+	float accel_pitch;	// holds the accelerometer's derrived pitch
+	float gyro_pitch;	// holds the gyroscope's integrated pitch
+	float comp_pitch;	// holds the complementary filter's computed pitch
 } Pitch_t;
 
 typedef struct {
-	TIM_HandleTypeDef *htim;
-	uint8_t channels[2];
+	TIM_HandleTypeDef *htim;	// pointer to the motor's timer handler struct
+	uint8_t channels[2];		// holds both motor's pwm channels
 } Motor_t;
+
+typedef enum {
+	COMPLETE_SUCCESS = 0,
+	IMU_CONFIG_FAILED_WAKE = -100,
+	IMU_CONFIG_FAILED_PWR_MGMT_2_READ = -101,
+	IMU_CONFIG_FAILED_PWR_MGMT_2_WRITE = -102,
+	IMU_CONFIG_FAILED_INTERRUPT_ENABLE = -103,
+} Error_code_t;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define I2C_TRIALS 5						// number of attempts to check device readiness
-#define MPU6050_Addr (0x68 << 1)
-#define MPU6050_WAKE 0x00
-#define PWR_MGMT_1_Addr 0x6B
-#define PWR_MGMT_2_Addr 0x6C
+#define MPU6050_Addr (0x68 << 1)			// address of the mpu6050 on the I2C line
+#define MPU6050_WAKE 0x00					// mask used to wake the mpu6050 from sleep
+#define PWR_MGMT_1_Addr 0x6B				// address of the first power management register of the mpu6050
+#define PWR_MGMT_2_Addr 0x6C				// address of the first power management register of the mpu6050
 #define INT_ENABLE_Addr 0x38				// address for imu registers that allows enabling of the interrupt pin
 #define STANDBY_ACCEL_Y_AXIS (1UL << 4) 	// mask for accelerometer y-axis standby mode bit
 #define STANDBY_GYRO_X_AXIS (1UL << 2) 		// mask for gyroscope x-axis standby mode bit
 #define STANDBY_GYRO_Z_AXIS (1UL << 0)  	// mask for gyroscope z-axis standby mode bit
-#define MPU6050_DATA_READY_Enable 0x01
-#define ACCEL_XOUT_H_Addr 0x3B
-#define ACCEL_XOUT_L_Addr 0x3C
-#define ACCEL_ZOUT_H_Addr 0x3F
-#define ACCEL_ZOUT_L_Addr 0x40
-#define GYRO_YOUT_H_Addr 0x45
-#define GYRO_YOUT_L_Addr 0x46
-#define ACCEL_SENSITIVITY 16384
-#define GYRO_SENSITIVITY 131
-#define FILTER_COEFF 0.98
+#define MPU6050_DATA_READY_Enable 0x01		// ???
+#define ACCEL_XOUT_H_Addr 0x3B				// address of the high byte for accelerometer x-axis output
+#define ACCEL_XOUT_L_Addr 0x3C				// address of the low byte for accelerometer x-axis output
+#define ACCEL_ZOUT_H_Addr 0x3F				// address of the high byte for accelerometer z-axis output
+#define ACCEL_ZOUT_L_Addr 0x40				// address of the low byte for accelerometer z-axis output
+#define GYRO_YOUT_H_Addr 0x45				// address of the high byte for gyroscope y-axis output
+#define GYRO_YOUT_L_Addr 0x46				// address of the high byte for gyroscope y-axis output
+#define ACCEL_SENSITIVITY 16384				// sensitivity value used to convert raw IMU data into units
+#define GYRO_SENSITIVITY 131				// sensitivity value used to convert raw IMU data into units
+#define COMP_FILTER_COEFF 0.99				// coefficient the complementary filter uses to weight its measurment
 
-#define IMU_CALIBRATION_PRE_MSG_DELAY 1000
-#define IMU_CALIBRATION_POST_MSG_DELAY 2000
-#define IMU_CONFIG_NUM_SAMPLES 3
+#define IMU_CALIBRATION_PRE_MSG_DELAY 1000	// delay before calibration message allowing user to get robot into place
+#define IMU_CALIBRATION_POST_MSG_DELAY 1000	// delay after calibration message allowing user to read the calibration value
 
-#define AUTO_RELOAD_REGISTER 4000
-#define TICKS_PER_SECOND 1000
+#define PRINT_IMU_CONFIG_ERRORS 1			// prints IMU configuration errors when set to 1
+#define PRINT_IMU_CALIBRATION_ERRORS 1		// prints IMU calibration errors when set to 1
+#define PRINT_I2C_ERRORS 0					// prints I2C communication info when set to 1
+#define PRINT_PID_ERROR 0					// prints PID errors when set to 1
 
-#define PRINT_I2C_ERRORS 0
-#define PRINT_IMU_CONFIG_ERRORS 0
-#define PRINT_IMU_CALIBRATION_ERRORS 0
-#define PRINT_COMPUTED_PITCHES 1
-#define PRINT_PID_ERROR 0
+#define PRINT_COMPUTED_PITCHES 0			// prints computed complementary pitches when set to 1
+#define IMU_CONFIG_NUM_SAMPLES 100			// number of samples that are to be used to zero out accelerometer pitch
+#define NUM_IMU_READ_ATTEMPTS_PER_READ 1	// when our attempt to read from the imu fails, this is the amount of retries before giving up
+
+#define AUTO_RELOAD_REGISTER 4000			// auto reload register value for the pwm channels
+#define TICKS_PER_SECOND 1000				// number of clock ticks per second
 
 #define I2C_TIMEOUT_MS 10 					// milliseconds to wait per attempt
 #define UART_TIMEOUT_MS HAL_MAX_DELAY 		// milliseconds to wait per uart transmit
+
+#define UART_INTERRUPT_CHAR_SENDBACK_TIMEOUT 10
+
+#define COEFFICIENT_PERCISION 3
+
+#define D_OUT_SCALER 100
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
+#define FATAL_ERROR(code) do { \
+    g_error_file = __FILE__; \
+    g_error_line = __LINE__; \
+    g_error_code = (code);   \
+    Error_Handler();         \
+} while(0)
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
@@ -115,24 +138,49 @@ const osThreadAttr_t defaultTask_attributes = { .name = "defaultTask", .stack_si
 		.priority = (osPriority_t) osPriorityNormal, };
 /* Definitions for imuReadTask */
 osThreadId_t imuReadTaskHandle;
-const osThreadAttr_t imuReadTask_attributes = { .name = "imuReadTask", .stack_size = 256 * 4,
+const osThreadAttr_t imuReadTask_attributes = { .name = "imuReadTask", .stack_size = 512 * 4,
 		.priority = (osPriority_t) osPriorityHigh, };
 /* Definitions for balanceTask */
 osThreadId_t balanceTaskHandle;
-const osThreadAttr_t balanceTask_attributes = { .name = "balanceTask", .stack_size = 256 * 4,
+const osThreadAttr_t balanceTask_attributes = { .name = "balanceTask", .stack_size = 512 * 4,
 		.priority = (osPriority_t) osPriorityHigh, };
+/* Definitions for coefficientPoll */
+osThreadId_t coefficientPollHandle;
+const osThreadAttr_t coefficientPoll_attributes = { .name = "coefficientPoll",
+		.stack_size = 512 * 4, .priority = (osPriority_t) osPriorityNormal, };
+/* Definitions for uartRxQueue */
+osMessageQueueId_t uartRxQueueHandle;
+const osMessageQueueAttr_t uartRxQueue_attributes = { .name = "uartRxQueue" };
 /* Definitions for imuDataMutex */
 osMutexId_t imuDataMutexHandle;
 const osMutexAttr_t imuDataMutex_attributes = { .name = "imuDataMutex" };
 /* Definitions for imuDataReadySem */
 osSemaphoreId_t imuDataReadySemHandle;
 const osSemaphoreAttr_t imuDataReadySem_attributes = { .name = "imuDataReadySem" };
+/* Definitions for uartDataReady */
+osSemaphoreId_t uartDataReadyHandle;
+const osSemaphoreAttr_t uartDataReady_attributes = { .name = "uartDataReady" };
 /* USER CODE BEGIN PV */
-volatile Pitch_t pitches = { // global reference to IMU acceleration and gyroscope estimated pitches (keep initialized to 0)
-		.accel_pitch = 0.0, .gyro_pitch = 0.0, .comp_pitch = 0.0 };
+volatile const char *g_error_file = NULL;
+volatile int g_error_line = 0;
+volatile int g_error_code = 0;
+
+volatile Pitch_t pitches = { .accel_pitch = 0.0, .gyro_pitch = 0.0, .comp_pitch = 0.0 };
 float initial_accel_pitch_offset_deg = 0.0f;
+
 Motor_t left_motor;
 Motor_t right_motor;
+
+uint8_t uart_recieved_byte;
+uint16_t uart_recieved_byte_size = sizeof(uart_recieved_byte);
+
+uint8_t uart_rx_buffer_index = 0;
+char uart_rx_buffer[6]; // [0] type | [1:3] value | [4] carriage return | [5] null-terminator
+uint16_t uart_rx_buffer_size = sizeof(uart_rx_buffer) / sizeof(uart_rx_buffer[0]);
+
+volatile float kp = 0.20;
+volatile float ki = 0.50;
+volatile float kd = 0.30;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -145,6 +193,7 @@ static void MX_TIM3_Init(void);
 void StartDefaultTask(void *argument);
 void startIMUReadTask(void *argument);
 void selfBalanceTask(void *argument);
+void coefficientPollingTask(void *argument);
 
 /* USER CODE BEGIN PFP */
 // --- IMU Functions ---
@@ -159,8 +208,10 @@ static void start_pwm_channels(void);
 static void set_motor_duty_cycle(Motor_t *motor, float speed_control);
 
 // --- Helper Functions ---
-static void uart_motor_speed_polling(void);
 static void uart_print(char *buffer);
+static void resetI2C(void);
+char* HAL_StatusToString(HAL_StatusTypeDef status);
+char* HAL_I2C_ErrorToString(I2C_HandleTypeDef* i2c_handle);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -169,7 +220,7 @@ static void uart_print(char *buffer);
 
 /**
  * @brief  The application entry point.
- * @retval int - should never return due to the FreeRTOS scheduler
+ * @retval int
  */
 int main(void) {
 
@@ -196,7 +247,6 @@ int main(void) {
 	MX_I2C1_Init();
 	MX_TIM2_Init();
 	MX_TIM3_Init();
-
 	/* USER CODE BEGIN 2 */
 	char nl[] = "\r\n";
 	uart_print(nl); // quick newline print to seperate console logs
@@ -216,6 +266,12 @@ int main(void) {
 	// Prepare imu
 	configure_imu_power(); // configure the imu for i2c communication
 	calibrate_imu(); // zero out the accelerometer's pitch calculation
+
+	// Start listening for user's input to tweak variables during runtime
+	if (HAL_UART_Receive_IT(&huart2, &uart_recieved_byte, 1) != HAL_OK) {
+		char error_buffer[] = "[WARNING]: UART interrupt service is not functioning\r\n";
+		uart_print(error_buffer);
+	}
 	/* USER CODE END 2 */
 
 	/* Init scheduler */
@@ -232,6 +288,9 @@ int main(void) {
 	/* creation of imuDataReadySem */
 	imuDataReadySemHandle = osSemaphoreNew(1, 0, &imuDataReadySem_attributes);
 
+	/* creation of uartDataReady */
+	uartDataReadyHandle = osSemaphoreNew(1, 0, &uartDataReady_attributes);
+
 	/* USER CODE BEGIN RTOS_SEMAPHORES */
 	/* add semaphores, ... */
 	/* USER CODE END RTOS_SEMAPHORES */
@@ -239,6 +298,10 @@ int main(void) {
 	/* USER CODE BEGIN RTOS_TIMERS */
 	/* start timers, add new ones, ... */
 	/* USER CODE END RTOS_TIMERS */
+
+	/* Create the queue(s) */
+	/* creation of uartRxQueue */
+	uartRxQueueHandle = osMessageQueueNew(8, sizeof(uint8_t), &uartRxQueue_attributes);
 
 	/* USER CODE BEGIN RTOS_QUEUES */
 	/* add queues, ... */
@@ -253,6 +316,9 @@ int main(void) {
 
 	/* creation of balanceTask */
 	balanceTaskHandle = osThreadNew(selfBalanceTask, NULL, &balanceTask_attributes);
+
+	/* creation of coefficientPoll */
+	coefficientPollHandle = osThreadNew(coefficientPollingTask, NULL, &coefficientPoll_attributes);
 
 	/* USER CODE BEGIN RTOS_THREADS */
 	/* add threads, ... */
@@ -575,10 +641,7 @@ static void configure_imu_power(void) {
 	data_byte = MPU6050_WAKE; // we will clear the sleep bit
 	while (HAL_I2C_Mem_Write(&hi2c1, MPU6050_Addr, PWR_MGMT_1_Addr, I2C_MEMADD_SIZE_8BIT,
 			&data_byte, 1, I2C_TIMEOUT_MS) != HAL_OK) {
-		if (PRINT_IMU_CONFIG_ERRORS) {
-			char error_buffer[] = "Failed to wake MPU6050\r\n";
-			uart_print(error_buffer);
-		}
+		FATAL_ERROR(IMU_CONFIG_FAILED_WAKE);
 	}
 
 	// Wait a few ms for the device to stabilize after power changes
@@ -588,10 +651,7 @@ static void configure_imu_power(void) {
 	// Read the current register value to not overwrite other settings
 	while (HAL_I2C_Mem_Read(&hi2c1, MPU6050_Addr, PWR_MGMT_2_Addr, I2C_MEMADD_SIZE_8BIT, &data_byte,
 			1, I2C_TIMEOUT_MS) != HAL_OK) {
-		if (PRINT_IMU_CONFIG_ERRORS) {
-			char error_buffer[] = "Failed to read from MPU6050 PWR_MGMT_2 register\r\n";
-			uart_print(error_buffer);
-		}
+		FATAL_ERROR(IMU_CONFIG_FAILED_PWR_MGMT_2_READ);
 	}
 
 	data_byte |= (STANDBY_ACCEL_Y_AXIS | STANDBY_GYRO_X_AXIS | STANDBY_GYRO_Z_AXIS);
@@ -600,10 +660,7 @@ static void configure_imu_power(void) {
 	while (HAL_I2C_Mem_Write(&hi2c1, MPU6050_Addr, PWR_MGMT_2_Addr, I2C_MEMADD_SIZE_8BIT,
 			&data_byte, 1,
 			I2C_TIMEOUT_MS) != HAL_OK) {
-		if (PRINT_IMU_CONFIG_ERRORS) {
-			char error_buffer[] = "Failed to write to MPU6050 PWR_MGMT_2 register\r\n";
-			uart_print(error_buffer);
-		}
+		FATAL_ERROR(IMU_CONFIG_FAILED_PWR_MGMT_2_WRITE);
 	}
 
 	// Enable the Data Ready Interrupt on the MPU6050
@@ -611,10 +668,7 @@ static void configure_imu_power(void) {
 	while (HAL_I2C_Mem_Write(&hi2c1, MPU6050_Addr, INT_ENABLE_Addr, I2C_MEMADD_SIZE_8BIT,
 			&data_byte, 1,
 			I2C_TIMEOUT_MS) != HAL_OK) {
-		if (PRINT_IMU_CONFIG_ERRORS) {
-			char error_buffer[] = "Failed to enable MPU6050 interrupt pin\r\n";
-			uart_print(error_buffer);
-		}
+		FATAL_ERROR(IMU_CONFIG_FAILED_INTERRUPT_ENABLE);
 	}
 }
 
@@ -632,21 +686,35 @@ static void calibrate_imu(void) {
 
 	// Make sure MPU is ready before starting
 	while (HAL_I2C_IsDeviceReady(&hi2c1, MPU6050_Addr, I2C_TRIALS, I2C_TIMEOUT_MS) != HAL_OK) {
-		if (PRINT_IMU_CALIBRATION_ERRORS) {
-			char error_buffer[] = "Warning: IMU not ready yet in configuration\r\n";
-			uart_print(error_buffer);
-		}
+		// wait for device to be ready
 	}
 
 	// Perform a number of reads to get a baseline measurment for zeroing out the accelerometer pitch
+	HAL_StatusTypeDef status;
+	int attempts;
 	for (int i = 0; i < IMU_CONFIG_NUM_SAMPLES; i++) {
-		// Read raw accelerometer data
-		while (HAL_I2C_Mem_Read(&hi2c1, MPU6050_Addr, ACCEL_XOUT_H_Addr, I2C_MEMADD_SIZE_8BIT,
-				rx_buffer, 14, I2C_TIMEOUT_MS) != HAL_OK) {
+		// We need to make sure we get a valid read for every sample to ensure our zeroing is accurate
+		attempts = 0;
+		while ((status = HAL_I2C_Mem_Read(&hi2c1, MPU6050_Addr, ACCEL_XOUT_H_Addr, I2C_MEMADD_SIZE_8BIT,
+				rx_buffer, 14, I2C_TIMEOUT_MS)) != HAL_OK && attempts < NUM_IMU_READ_ATTEMPTS_PER_READ) {
+			// We will attempt to read the IMU, and if it doesnt give us a valid read after x, attemps reset the I2C bus and try again
 			if (PRINT_IMU_CALIBRATION_ERRORS) {
-				char error_buffer[] = "Failed to read data from IMU during configuration.\r\n";
+				char error_buffer[128];
+				sprintf(error_buffer, "Failed to read from IMU during calibration [%s]\r\n", HAL_StatusToString(status));
 				uart_print(error_buffer);
+
+				if (status == HAL_ERROR) {
+					// If the status is an I2C error, print info
+					uart_print(HAL_I2C_ErrorToString(&hi2c1));
+				}
 			}
+
+			attempts++;
+			if (attempts >= NUM_IMU_READ_ATTEMPTS_PER_READ) {
+				resetI2C();
+				attempts = 0;
+			}
+
 		}
 
 		// Since read was successful, decode it
@@ -665,8 +733,7 @@ static void calibrate_imu(void) {
 	float avg_accel_z_g_force = sum_accel_z_g_force / IMU_CONFIG_NUM_SAMPLES;
 
 	// Calculate the initial angle from the averages and store it
-	initial_accel_pitch_offset_deg = atan2(avg_accel_x_g_force, avg_accel_z_g_force)
-			* 180.0/ M_PI;
+	initial_accel_pitch_offset_deg = atan2(avg_accel_x_g_force, avg_accel_z_g_force) * 180.0 / M_PI;
 
 	char calibration_complete[128];
 	sprintf(calibration_complete, "Calibration complete! Offset Angle: %f\r\n",
@@ -698,8 +765,8 @@ static void process_imu_data(const uint8_t *data_buffer, Pitch_t *pitch_buffer, 
 	pitch_buffer->accel_pitch = relative_accel_pitch_deg;
 	pitch_buffer->gyro_pitch = (gyro_y * dt);
 	osMutexAcquire(imuDataMutexHandle, osWaitForever);
-	pitch_buffer->comp_pitch = FILTER_COEFF * (pitches.comp_pitch - pitch_buffer->gyro_pitch)
-			+ (1.0 - FILTER_COEFF) * pitch_buffer->accel_pitch;
+	pitch_buffer->comp_pitch = COMP_FILTER_COEFF * (pitches.comp_pitch - pitch_buffer->gyro_pitch)
+			+ (1.0 - COMP_FILTER_COEFF) * pitch_buffer->accel_pitch;
 	osMutexRelease(imuDataMutexHandle);
 }
 
@@ -742,20 +809,14 @@ static void print_i2c_read_error(void) {
 				"MPU6050 Read Error: Acknowledge Failure (AF/NACK). Sensor may be busy or disconnected.\r\n");
 	} else if (i2c_error & HAL_I2C_ERROR_OVR) {
 		sprintf(errorBuffer, "MPU6050 Read Error: Overrun/Underrun (OVR).\r\n");
+	} else if (i2c_error & HAL_I2C_ERROR_TIMEOUT) {
+		sprintf(errorBuffer, "MPU6050 Read Error: Timeout occurred. Check bus activity.\r\n");
+	} else if (i2c_error & HAL_I2C_ERROR_DMA) {
+		sprintf(errorBuffer, "MPU6050 Read Error: DMA transfer error.\r\n");
 	} else {
 		sprintf(errorBuffer, "MPU6050 Read Error: Unknown I2C Error. Code: 0x%lX\r\n", i2c_error);
 	}
 	uart_print(errorBuffer);
-}
-
-/**
- * @brief Handles hardware level interrupts
- */
-void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
-	// Check if the interrupt came from the IMU's interrupt pin
-	if (GPIO_Pin == MPU6050_INT_Pin) {
-		osSemaphoreRelease(imuDataReadySemHandle);
-	}
 }
 
 /*===============================================================================================*/
@@ -810,61 +871,33 @@ static void set_motor_duty_cycle(Motor_t *motor, float speed_control) {
 }
 
 /*===============================================================================================*/
-// Helper Functions
+// Hardware Level Interrupts
 /*===============================================================================================*/
 
 /**
- * @brief Helper used to constantly poll the usart line to quickly manipulate speed during the robot's runtime
+ * @brief Callback function for when there is a hardware level interrupt on the ??? line
  */
-static void uart_motor_speed_polling(void) {
-	while (1) {
-		uint8_t index = 0;
-		uint8_t recieved_byte;
-		uint16_t recieved_byte_size = sizeof(recieved_byte);
-
-		char rx_buffer[20];
-		uint16_t rx_buffer_size = sizeof(rx_buffer) / sizeof(rx_buffer[0]);
-		memset(rx_buffer, 0, sizeof(rx_buffer));
-
-		char msg_buffer[32] = "Enter a speed: ";
-		uart_print(msg_buffer);
-
-		while (index < rx_buffer_size - 1) {
-			HAL_UART_Receive(&huart2, &recieved_byte, recieved_byte_size, HAL_MAX_DELAY);
-
-			if (recieved_byte == '\r' || recieved_byte == '\n') {
-				char newline[] = "\r\n";
-				uart_print(newline);
-				index = 0;
-				break;
-			} else if (recieved_byte == 127 || recieved_byte == 8) {
-				if (index > 0) {
-					index--;
-					char backspace_seq[] = "\b \b";
-					uart_print(backspace_seq);
-				}
-
-			} else {
-				HAL_UART_Transmit(&huart2, &recieved_byte, sizeof(recieved_byte),
-				HAL_MAX_DELAY); // print the typed character back to user
-				char recieved_char = (char) recieved_byte;
-				rx_buffer[index++] = recieved_char;
-			}
-		}
-
-		float speed = atof(rx_buffer);
-
-		// Clamp the value
-		speed = (speed > 1) ? 1 : speed;
-		speed = (speed < -1) ? -1 : speed;
-
-		sprintf(msg_buffer, "Setting speed to: %.2f\r\n", speed);
-		uart_print(msg_buffer);
-
-		set_motor_duty_cycle(&left_motor, speed);
-		set_motor_duty_cycle(&right_motor, speed);
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
+	// Check if the interrupt came from the IMU's interrupt pin
+	if (GPIO_Pin == MPU6050_INT_Pin) {
+		osSemaphoreRelease(imuDataReadySemHandle);
 	}
 }
+
+/**
+ * @brief Callback function when data is asyncronously detected on the UART2 line
+ */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
+	if (huart->Instance != USART2)
+		return;
+
+	osMessageQueuePut(uartRxQueueHandle, &uart_recieved_byte, 0, 0);
+	HAL_UART_Receive_IT(&huart2, &uart_recieved_byte, 1);
+}
+
+/*===============================================================================================*/
+// Helper Functions
+/*===============================================================================================*/
 
 /**
  * @brief Prints a character buffer over the uart communication channel
@@ -874,8 +907,52 @@ static void uart_print(char *buffer) {
 	HAL_UART_Transmit(&huart2, (uint8_t*) buffer, strlen(buffer), UART_TIMEOUT_MS);
 }
 
-/*===============================================================================================*/
+/**
+ * @brief TODO
+ */
+static void resetI2C(void) {
+	HAL_I2C_DeInit(&hi2c1);
+	HAL_I2C_Init(&hi2c1);
+	HAL_I2CEx_ConfigAnalogFilter(&hi2c1, I2C_ANALOGFILTER_ENABLE);
+	HAL_I2CEx_ConfigDigitalFilter(&hi2c1, 0);
+}
 
+char* HAL_StatusToString(HAL_StatusTypeDef status) {
+    switch (status) {
+        case HAL_OK:
+            return "HAL_OK";
+        case HAL_ERROR:
+            return "HAL_ERROR";
+        case HAL_BUSY:
+            return "HAL_BUSY";
+        case HAL_TIMEOUT:
+            return "HAL_TIMEOUT";
+        default:
+            return "UNKNOWN_STATUS";
+    }
+}
+
+char* HAL_I2C_ErrorToString(I2C_HandleTypeDef* i2c_handle) {
+	uint32_t error = HAL_I2C_GetError(i2c_handle);
+
+	if (error & HAL_I2C_ERROR_BERR) {
+		return "--> Specific Error: Bus Error (BERR)\r\n";
+	}
+	if (error & HAL_I2C_ERROR_ARLO) {
+		return "--> Specific Error: Arbitration Lost (ARLO)\r\n";
+	}
+	if (error & HAL_I2C_ERROR_AF) {
+		return "--> Specific Error: Acknowledge Failure (AF)\r\n";
+	}
+	if (error & HAL_I2C_ERROR_OVR) {
+		return "--> Specific Error: Overrun/Underrun (OVR)\r\n";
+	}
+	else {
+		return "--> Unknown Error: No information can be provided (N/A)\r\n";
+	}
+}
+
+/*===============================================================================================*/
 /* USER CODE END 4 */
 
 /* USER CODE BEGIN Header_StartDefaultTask */
@@ -912,25 +989,26 @@ void startIMUReadTask(void *argument) {
 
 		// Keep track of the system tick so we can integrate gyro rotation
 		uint32_t current_tick = osKernelGetTickCount();
-		float dt = (float) (current_tick - last_tick) / TICKS_PER_SECOND;
+		float dt = (float) (current_tick - last_tick) / (float) TICKS_PER_SECOND;
 		last_tick = current_tick;
 
 		// Read the accelerometer and gyroscope data into a buffer
-		HAL_StatusTypeDef status;
+		HAL_StatusTypeDef status = HAL_OK;
 		uint8_t rx_buffer[14];
-		status = HAL_I2C_Mem_Read(&hi2c1, MPU6050_Addr, ACCEL_XOUT_H_Addr,
-		I2C_MEMADD_SIZE_8BIT, rx_buffer, 14, I2C_TIMEOUT_MS);
+		for (uint8_t attempts = 0; attempts < NUM_IMU_READ_ATTEMPTS_PER_READ; attempts++) {
+			status = HAL_I2C_Mem_Read(&hi2c1, MPU6050_Addr, ACCEL_XOUT_H_Addr, I2C_MEMADD_SIZE_8BIT,
+					rx_buffer, 14, I2C_TIMEOUT_MS);
+			if (status == HAL_OK)
+				break;
+		}
 
 		if (status != HAL_OK) {
 			// Attempt to recover the I2C bus by re-initializing it
-			HAL_I2C_DeInit(&hi2c1);
-			HAL_I2C_Init(&hi2c1);
+			resetI2C();
 
 			if (PRINT_I2C_ERRORS) {
 				print_i2c_read_error();
 			}
-
-			//osDelay(100); // give the i2c line time to recover
 		}
 
 		Pitch_t pitch_buffer;
@@ -952,44 +1030,47 @@ void startIMUReadTask(void *argument) {
 void selfBalanceTask(void *argument) {
 	/* USER CODE BEGIN selfBalanceTask */
 	uint32_t last_tick = osKernelGetTickCount(); // initialize starting tick
-	float integralSum = 0;
+	float integralSum = 0.0;
 	float prev_error = 0.0;
+
+	float d_out_filtered_prev = 0.0; // Buffer for previous error of d_output's low-pass filter
+	float prev_bias = 0.8;
 
 	/* Infinite loop */
 	for (;;) {
 		osMutexAcquire(imuDataMutexHandle, osWaitForever); // aquire imuData mutex before reading complementary pitch
-		float error = 0 - pitches.comp_pitch; // get error (setpoint is 0 degrees)
+		float error = 0 - pitches.comp_pitch; 				// get error (setpoint is 0 degrees)
 		osMutexRelease(imuDataMutexHandle);
 
 		// Robot is laying on its side - kill motors, reset variables, and skip cycle
 		if (abs(error) >= 40) {
 			set_motor_duty_cycle(&left_motor, 0);
 			set_motor_duty_cycle(&right_motor, 0);
-			last_tick = osKernelGetTickCount(); // reset last tick in case robot has been on it's side for a while
+			last_tick = osKernelGetTickCount(); // reset last tick so that the integral sum doesnt get out of control
+			integralSum = 0;
 			continue;
 		}
 
+		// Manage time variables
 		uint32_t current_tick = osKernelGetTickCount(); // initialize starting tick
-		uint32_t dt = (current_tick - last_tick) / TICKS_PER_SECOND;
+		float dt = (float) (current_tick - last_tick) / (float) TICKS_PER_SECOND;
 		last_tick = current_tick;
-
-		float kp = 0.20;
-		float ki = 0.00;
-		float kd = 0.00;
 
 		// Calculate p-error
 		float p_out = kp * (error);
 
 		// Calculate i-error
-		// *** IMPORTANT : Think about clamping the integral sum to prevent huge corrections when first placing robot down ***
+		// *** IMPORTANT : Might need to clamp the integral sum to prevent huge corrections when first placing robot down ***
 		integralSum += error * dt;
 		float i_out = ki * (integralSum);
 
 		// Calculate d-error
 		float d_out = 0.0f;
 		if (dt > 0) { // protect from divide-by-zero error
-			d_out = kd * ((error - prev_error) / dt);
+			d_out = kd * ((error - prev_error) / dt) / D_OUT_SCALER;
 		}
+//		float d_out_filtered = (prev_bias * d_out_filtered_prev) + ((1 - prev_bias) * d_out);
+//		d_out_filtered_prev = d_out_filtered;
 
 		// Final calculation
 		float output = p_out + i_out + d_out;
@@ -999,15 +1080,88 @@ void selfBalanceTask(void *argument) {
 		set_motor_duty_cycle(&left_motor, output);
 		set_motor_duty_cycle(&right_motor, output);
 
-		if (PRINT_PID_ERROR) {
-			char print_buf[32];
-			sprintf(print_buf, "pid error: %f\r\n", output);
-			uart_print(print_buf);
-		}
-
 		osDelay(10);
 	}
 	/* USER CODE END selfBalanceTask */
+}
+
+/* USER CODE BEGIN Header_coefficientPollingTask */
+/**
+ * @brief Function implementing the coefficientPoll thread.
+ * @param argument: Not used
+ * @retval None
+ */
+/* USER CODE END Header_coefficientPollingTask */
+void coefficientPollingTask(void *argument) {
+	/* USER CODE BEGIN coefficientPollingTask */
+	osMessageQueueReset(uartRxQueueHandle);
+
+	/* Infinite loop */
+	for (;;) {
+		char queue_byte;
+		osStatus_t status = osMessageQueueGet(uartRxQueueHandle, &queue_byte, NULL, osWaitForever);
+
+		// Echo the character back to the terminal
+		HAL_UART_Transmit(&huart2, (uint8_t*) &queue_byte, 1, 10);
+
+		if (status == osOK) {
+			// This logic now uses the correct global buffer that the ISR writes to
+			uart_rx_buffer[uart_rx_buffer_index++] = queue_byte;
+
+			if (queue_byte == '\r') { // Use carriage return as the submission character
+				uart_rx_buffer[uart_rx_buffer_index - 1] = '\0'; // Null-terminate the string
+
+				char cmd_type = uart_rx_buffer[0];
+				char cmd_value_buffer[4];
+				int cmd_value_buffer_size = sizeof(cmd_value_buffer) / sizeof(cmd_value_buffer[0]);
+				strncpy(cmd_value_buffer, &uart_rx_buffer[1], COEFFICIENT_PERCISION);
+				cmd_value_buffer[cmd_value_buffer_size - 1] = '\0';
+
+				// Reset buffer for next command
+				memset(uart_rx_buffer, 0, uart_rx_buffer_size);
+				uart_rx_buffer_index = 0;
+
+				int cmd_value = atoi(cmd_value_buffer);
+				if (cmd_value > 99)
+					cmd_value = 99;
+				if (cmd_value < 0)
+					cmd_value = 0;
+				float cmd_value_f = ((float) cmd_value / 100.0f);
+
+				char print_buffer[64];
+				switch (cmd_type) {
+				case 'p':
+				case 'P':
+					kp = cmd_value_f;
+					sprintf(print_buffer, "\r\nSet Proportional (kp) to 0.%03d\r\n", cmd_value);
+					uart_print(print_buffer);
+					break;
+				case 'i':
+				case 'I':
+					ki = cmd_value_f;
+					sprintf(print_buffer, "\r\nSet Integral (ki) to 0.%03d\r\n", cmd_value);
+					uart_print(print_buffer);
+					break;
+				case 'd':
+				case 'D':
+					kd = cmd_value_f;
+					sprintf(print_buffer, "\r\nSet Derivative (kd) to 0.%03d\r\n", cmd_value);
+					uart_print(print_buffer);
+					break;
+				default:
+					uart_print("\r\nInvalid command. Use 'p', 'i', or 'd'.\r\n");
+					break;
+				}
+			} else if (uart_rx_buffer_index >= uart_rx_buffer_size - 1) {
+				// Buffer is full but no carriage return, reset to prevent overflow
+				uart_print("\r\nBuffer full, clearing. Please re-enter command.\r\n");
+				memset(uart_rx_buffer, 0, uart_rx_buffer_size);
+				uart_rx_buffer_index = 0;
+			}
+		}
+		osDelay(1);
+	}
+	/* USER CODE END coefficientPollingTask */
 }
 
 /**
@@ -1036,7 +1190,9 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
  */
 void Error_Handler(void) {
 	/* USER CODE BEGIN Error_Handler_Debug */
-	/* User can add his own implementation to report the HAL error return state */
+	char error_buffer[256];
+	sprintf(error_buffer, "[FATAL ERROR]: Code %d at %s:%d", g_error_code, g_error_file,
+			g_error_line);
 	__disable_irq();
 	while (1) {
 	}
