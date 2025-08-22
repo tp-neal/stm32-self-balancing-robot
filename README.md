@@ -2,7 +2,7 @@
 
 This repository contains the firmware and supporting tools for a two-wheeled self-balancing robot built on an STM32 Nucleo-L476RG development board. The project leverages **FreeRTOS** for real-time task management and implements a **PID control loop** to maintain balance.
 
-<img src="./media/demo.gif" alt="Balancing Demo" width="15%">
+<img src="./media/demo.gif" alt="Balancing Demo" width="30%">
 
 ---
 
@@ -80,7 +80,7 @@ You can find the 3D model files [here]().
 
 #### **Power Systems Schematic**
 
-<img src="./media/Power-Systems-Schematic_Self-Balancing-Robot_2025-08-19.png" alt="Power Systems Schematic" width="50.5%">
+<img src="./media/Power-Systems-Schematic_Self-Balancing-Robot_2025-08-19.png" alt="Power Systems Schematic">
 
 #### **Logic Schematic**
 
