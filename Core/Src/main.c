@@ -179,7 +179,7 @@ char uart_rx_buffer[6]; // [0] type | [1:3] value | [4] carriage return | [5] nu
 uint16_t uart_rx_buffer_size = sizeof(uart_rx_buffer) / sizeof(uart_rx_buffer[0]);
 
 volatile float kp = 0.20;
-volatile float ki = 0.50;
+volatile float ki = 1.00;
 volatile float kd = 0.30;
 /* USER CODE END PV */
 
@@ -1122,8 +1122,6 @@ void coefficientPollingTask(void *argument) {
 				uart_rx_buffer_index = 0;
 
 				int cmd_value = atoi(cmd_value_buffer);
-				if (cmd_value > 99)
-					cmd_value = 99;
 				if (cmd_value < 0)
 					cmd_value = 0;
 				float cmd_value_f = ((float) cmd_value / 100.0f);
