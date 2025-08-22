@@ -74,9 +74,9 @@ This repository contains the firmware and supporting tools for a two-wheeled sel
 
 ### 1. Hardware Design & Implementation
 
-The robot is built on a custom, two-tiered chassis designed in Fusion 360 to provide a compact and stable platform the electronic components. The center of gravity is kept low for ease of balancing, while the IMU is placed high for quick and accurate pitch measurments.
+The robot is built on a custom, two-tiered chassis designed in Fusion 360 to provide a compact and stable platform ofr the electronic components. The center of gravity is kept low for ease of balancing, while the IMU is placed high for quick and accurate pitch measurments.
 
-You can find the 3D model files [here]().
+You can find the 3D model files [here](/models/2-Wheel+Self-balancing+Robot.stl).
 
 #### **Power Systems Schematic**
 
@@ -103,13 +103,13 @@ During development, removable fasteners like zip ties and adhesive putty were us
 
 ## Usage
 
-Once the firmware is flashed, power on the robot. It must be held level on a flat surface for a few seconds to allow for IMU calibration. The firmware takes an average of initial accelerometer readings (exact amount can be changed by making tweaks to the macro) to calculate a pitch offset. This process zeroes out any inherent sensor bias or slight mounting imperfections.
+Once the firmware is flashed, power on the robot. It must be held level on a flat surface for a few seconds to allow for IMU calibration. The firmware takes an average of the sum of several initial accelerometer readings to calculate a pitch offset (exact amount of samples can be changed by making tweaks to the IMU_CONFIG_NUM_SAMPLES macro in main.c). This process zeroes out any inherent sensor bias or slight mounting imperfections.
 
 A message will be printed over the UART line indicating that calibration is in progress, followed by a message with the calculated offset angle upon completion.
 
 After calibration, the robot will immediately enter its balancing routine. When slightly tilted upright, the motors will engage to maintain balance.
 
-When the robot falls below a specified angle in which it determins it has "tipped over," it kills power to the motors to save power, and resets the PID loops running itegral sum to prevent from overadjustments when the robot's pitch is rectified.
+When the robot falls below a specified angle in which it determines it has "tipped over," it kills power to the motors to save power, and resets the PID loops running itegral sum to prevent from overadjustments when the robot's pitch is rectified.
 
 ### Real-time PID Tuning
 
@@ -166,12 +166,12 @@ A complementary filter was implemented in `process_imu_data()` to fuse these two
 
 Where `a` is the filter coefficient (`COMP_FILTER_COEFF`), set to `0.99`. This heavily weights the integrated gyroscope reading for short-term changes while slowly "correcting" it towards the accelerometer's absolute reading over the long term.
 
+---
+
 You might notice that this differs from the standard complementary filter formula which is:
 filtered angle = (1 - alpha) _ (previous filtered angle `+` gyro angle change) + alpha _ accelerometer angle
 
----
-
-The reason for this is in the way that the `atan2()` function works in C. The drawback of the `atan()` function, is with the orientation of the IMU, all rotation while the robot is not held upside down will occur within 0 - 180 degrees. This means that every value computed from the accelerometers pitch will be positive. The gyroscope however, will produce a positive or negative pitch based on its orientation and the direction it is rotated in. To match this, we use the atan2() function, which yada yada
+The reason for this is in the way that the `atan2()` function works in C. The drawback of the `atan()` function is that there is overlap in readings even while at different rotations of the robot. Lets say we hold the robot at 45 degrees. Then we rotate it another 180 degrees. We would expect this reading to be 225 degrees total. However, due to the way arctangent is calculated, it will actually read 45 degrees again. This usually does not cause issue as our robot realistically will only rotate within a subsection of 0 to 180 degrees. However, for clarity and ease of matching the accelerometer's rotation with the gyroscopic reading, I've decided to move forward with atan2() instead. This allows us to read a full -180 to +180 degree range.
 
 ---
 
